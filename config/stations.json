@@ -1,0 +1,29 @@
+{
+    "stations": {
+        "CENTRAL_PARK_NY": {
+            "station_id": "KNYC",
+            "wfo": "OKX",
+            "cli_code": "NYC",
+            "timezone": "America/New_York",
+            "name": "New York City - Central Park"
+        },
+        "LAX_AIRPORT_CA": {
+            "station_id": "KLAX",
+            "wfo": "LOX",
+            "cli_code": "LAX",
+            "timezone": "America/Los_Angeles",
+            "name": "Los Angeles International Airport"
+        },
+        "OHARE_AIRPORT_IL": {
+            "station_id": "KORD",
+            "wfo": "LOT",
+            "cli_code": "ORD",
+            "timezone": "America/Chicago",
+            "name": "Chicago O'Hare International Airport"
+        }
+    },
+    "defaults": {
+        "user_agent": "(my_weather_app, contact@example.com)",
+        "observation_interval_minutes": 15
+    }
+}
