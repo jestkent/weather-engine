@@ -20,6 +20,50 @@
             "cli_code": "ORD",
             "timezone": "America/Chicago",
             "name": "Chicago O'Hare International Airport"
+        },
+        "SHOW_LOW_AZ": {
+            "station_id": "KSOW",
+            "wfo": "FGZ",
+            "cli_code": "SOW",
+            "timezone": "America/Phoenix",
+            "name": "Show Low Regional Airport (Cibecue Area)"
+        },
+        "PHOENIX_AZ": {
+            "station_id": "KPHX",
+            "wfo": "PSR",
+            "cli_code": "PHX",
+            "timezone": "America/Phoenix",
+            "name": "Phoenix Sky Harbor International Airport"
+        },
+        "MIAMI_FL": {
+            "station_id": "KMIA",
+            "wfo": "MFL",
+            "timezone": "America/New_York",
+            "name": "Miami International Airport"
+        },
+        "SAN_FRANCISCO_CA": {
+            "station_id": "KSFO",
+            "wfo": "MTR",
+            "timezone": "America/Los_Angeles",
+            "name": "San Francisco International Airport"
+        },
+        "LAS_VEGAS_NV": {
+            "station_id": "KLAS",
+            "wfo": "VEF",
+            "timezone": "America/Los_Angeles",
+            "name": "Las Vegas Harry Reid Airport"
+        },
+        "DENVER_CO": {
+            "station_id": "KDEN",
+            "wfo": "BOU",
+            "timezone": "America/Denver",
+            "name": "Denver International Airport"
+        },
+        "SEATTLE_WA": {
+            "station_id": "KSEA",
+            "wfo": "SEW",
+            "timezone": "America/Los_Angeles",
+            "name": "Seattle-Tacoma International Airport"
         }
     },
     "defaults": {

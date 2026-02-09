@@ -1,107 +1,179 @@
 import streamlit as st
-import pandas as pd
 import sqlite3
+import pandas as pd
+import plotly.graph_objects as go
+import requests
 import json
-import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="NOAA Weather Intelligence", layout="wide")
+DB_FILE = "data/observations.db"
+CONFIG_FILE = "config/stations.json"
+USER_AGENT = "(weather-engine-v5, contact@github.com)"
+DASHBOARD_TIMEZONE = 'America/New_York' 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, 'config', 'stations.json')
-DB_PATH = os.path.join(BASE_DIR, 'data', 'observations.db')
+st.set_page_config(page_title="Weather Engine AI", page_icon="🌤️", layout="wide")
 
-@st.cache_data
-def load_config():
-    with open(CONFIG_PATH, 'r') as f:
-        return json.load(f)
+# --- 1. LOAD CONFIGURATION (For Friendly Names) ---
+def get_station_mapping():
+    """Reads the JSON config to create a dictionary of friendly names."""
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+        
+        mapping = {}
+        # Loop through the config to match IDs with Names
+        # Example: mapping['KSOW'] = "KSOW (SHOW_LOW_AZ)"
+        for key, info in config.get("stations", {}).items():
+            sid = info.get("station_id")
+            if sid:
+                mapping[sid] = f"{sid} ({key})"
+        return mapping
+    except Exception as e:
+        print(f"⚠️ Could not load config names: {e}")
+        return {}
 
-def get_data(station_id, timezone_str):
-    conn = sqlite3.connect(DB_PATH)
-    
-    # Load all data for this station
-    query = f"SELECT timestamp, temp_f FROM observations WHERE station_id = '{station_id}'"
-    df = pd.read_sql_query(query, conn)
+# --- 2. GET AVAILABLE STATIONS FROM DB ---
+def get_stations():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        query = "SELECT DISTINCT station_id FROM observations"
+        df = pd.read_sql(query, conn)
+        conn.close()
+        return df['station_id'].tolist()
+    except:
+        return []
+
+# --- 3. GET HISTORICAL DATA ---
+def get_data(station_code):
+    conn = sqlite3.connect(DB_FILE)
+    query = """
+        SELECT timestamp, temp_f as temperature 
+        FROM observations 
+        WHERE station_id = ? 
+        AND timestamp >= datetime('now', '-3 days')
+        ORDER BY timestamp ASC
+    """
+    df = pd.read_sql(query, conn, params=(station_code,))
     conn.close()
+    
+    if not df.empty:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['timestamp'] = df['timestamp'].dt.tz_convert(DASHBOARD_TIMEZONE)
+    
+    return df
 
-    if df.empty:
+# --- 4. GET FORECAST (Bulletproof) ---
+def get_forecast(station_id):
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        # Step 1: Get Lat/Lon
+        url1 = f"https://api.weather.gov/stations/{station_id}"
+        r1 = requests.get(url1, headers=headers)
+        if r1.status_code != 200: return pd.DataFrame()
+        
+        coords = r1.json()['geometry']['coordinates']
+        lon, lat = coords[0], coords[1]
+        
+        # Step 2: Get Gridpoint
+        url2 = f"https://api.weather.gov/points/{lat},{lon}"
+        r2 = requests.get(url2, headers=headers)
+        if r2.status_code != 200: return pd.DataFrame()
+        
+        forecast_url = r2.json()['properties']['forecastHourly']
+        
+        # Step 3: Get Data
+        r3 = requests.get(forecast_url, headers=headers)
+        if r3.status_code != 200: return pd.DataFrame()
+            
+        periods = r3.json()['properties']['periods']
+        future_data = []
+        for p in periods[:24]:
+            future_data.append({
+                'timestamp': pd.to_datetime(p['startTime']),
+                'temperature': p['temperature']
+            })
+        return pd.DataFrame(future_data)
+        
+    except Exception as e:
+        print(f"Forecast Error: {e}")
         return pd.DataFrame()
 
-    # Convert strings to datetime objects
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    # Handle timezones (Assuming source is UTC)
-    if df['timestamp'].dt.tz is None:
-        df['timestamp'] = df['timestamp'].dt.tz_localize('UTC')
-    
-    # Convert to target station timezone
-    target_tz = pytz.timezone(timezone_str)
-    df['local_time'] = df['timestamp'].dt.tz_convert(target_tz)
+# --- MAIN APP LAYOUT ---
 
-    # Filter for TODAY only (based on local time)
-    now_local = datetime.now(target_tz)
-    today_date = now_local.date()
-    
-    df = df[df['local_time'].dt.date == today_date]
-    df = df.sort_values('local_time')
-    
-    return df, now_local # Return current time too
+# 1. Sidebar Control
+available_stations = get_stations()
+station_map = get_station_mapping()
 
-def main():
-    st.title("🌤️ Weather Intelligence Engine")
+if not available_stations:
+    st.warning("Waiting for data collector... (Check if run_forever.py is running)")
+    st.stop()
 
-    # Sidebar
-    config = load_config()
-    station_map = {v['name']: k for k, v in config['stations'].items()}
-    selected_name = st.sidebar.selectbox("Select Station", list(station_map.keys()))
-    
-    # Get station details
-    station_key = station_map[selected_name]
-    station_data = config['stations'][station_key]
-    station_id = station_data['station_id']
-    tz_str = station_data['timezone']
+# This is the magic part: We use 'format_func' to show the friendly name
+selected_station = st.sidebar.selectbox(
+    "Select Station:", 
+    available_stations,
+    format_func=lambda x: station_map.get(x, x) # Shows "KSOW (SHOW_LOW_AZ)"
+)
 
-    # Load Data & Current Time
-    df, current_time = get_data(station_id, tz_str)
+# 2. Header and Time
+tz = pytz.timezone(DASHBOARD_TIMEZONE)
+current_time = datetime.now(tz).strftime("%A, %B %d, %I:%M %p")
 
-    # --- DISPLAY LOCAL TIME ---
-    # Format: "Sunday, 12:45 AM"
-    time_str = current_time.strftime("%A, %I:%M %p")
-    st.markdown(f"### 🕒 Local Time: **{time_str}**")
-    st.caption(f"Timezone: {tz_str}")
+# Get friendly name for title too
+friendly_title = station_map.get(selected_station, selected_station)
 
-    if df.empty:
-        st.warning(f"No data collected for **{current_time.strftime('%A')}** yet.")
-        st.info("💡 Tip: It might be a new day! Run `py weather/live_observations.py` to get the first reading.")
-        return
+st.title(f"🌤️ {friendly_title}")
+st.markdown(f"### 🕒 {current_time}")
 
-    # Metrics
-    current_temp = df['temp_f'].iloc[-1]
-    high = df['temp_f'].max()
-    low = df['temp_f'].min()
-    
-    # Calculate Change (Last reading vs. 1 hour ago)
-    delta = 0.0
-    if len(df) >= 4:
-        past_temp = df['temp_f'].iloc[-4]
-        delta = current_temp - past_temp
+# 3. Load Data
+df = get_data(selected_station)
+df_forecast = get_forecast(selected_station)
 
-    # Display Columns
-    st.divider()
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Current Temp", f"{current_temp:.1f}°F", f"{delta:+.1f}°F / hr")
-    col2.metric("Today's High", f"{high:.1f}°F")
-    col3.metric("Today's Low", f"{low:.1f}°F")
-    col4.metric("Data Points", len(df))
+if df.empty:
+    st.warning("No historical data yet.")
+    st.stop()
 
-    # Chart
-    st.subheader(f"Temperature Trend")
-    
-    # Prepare chart data (Time on X, Temp on Y)
-    chart_data = df.set_index('local_time')['temp_f']
-    st.line_chart(chart_data, color="#ff4b4b")
+# --- DATA PROCESSING ---
+now = datetime.now(tz)
+start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-if __name__ == "__main__":
-    main()
+df_yesterday = df[df['timestamp'] < start_of_today]
+df_today = df[df['timestamp'] >= start_of_today]
+
+# --- METRICS ---
+curr_temp = df_today.iloc[-1]['temperature'] if not df_today.empty else 0
+high_today = df_today['temperature'].max() if not df_today.empty else 0
+low_today = df_today['temperature'].min() if not df_today.empty else 0
+high_tmrw = df_forecast['temperature'].max() if not df_forecast.empty else "N/A"
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Current Temp", f"{curr_temp}°F")
+c2.metric("Today's High", f"{high_today}°F")
+c3.metric("Today's Low", f"{low_today}°F")
+c4.metric("Tomorrow High", f"{high_tmrw}°F")
+
+# --- CHART ---
+fig = go.Figure()
+
+if not df_yesterday.empty:
+    fig.add_trace(go.Scatter(x=df_yesterday['timestamp'], y=df_yesterday['temperature'],
+                             mode='lines', name='Yesterday', line=dict(color='grey', width=2)))
+
+if not df_today.empty:
+    fig.add_trace(go.Scatter(x=df_today['timestamp'], y=df_today['temperature'],
+                             mode='lines', name='Today', line=dict(color='blue', width=4)))
+
+if not df_forecast.empty:
+    fig.add_trace(go.Scatter(x=df_forecast['timestamp'], y=df_forecast['temperature'],
+                             mode='lines', name='Forecast (24h)', line=dict(color='orange', width=3, dash='dash')))
+
+fig.update_layout(
+    title=f"72-Hour Timeline: {friendly_title}",
+    xaxis=dict(title="Time", tickformat="%I:%M %p"),
+    yaxis=dict(title="Temp (°F)"),
+    hovermode="x unified"
+)
+
+st.plotly_chart(fig, use_container_width=True)
