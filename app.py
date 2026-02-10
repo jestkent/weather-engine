@@ -159,7 +159,7 @@ current_time = datetime.now(tz_obj).strftime("%A, %B %d, %I:%M %p")
 
 friendly_title = station_map.get(selected_station, selected_station)
 
-st.title(f"🌤️ {friendly_title}")
+st.title(f"🌤️ {friendly_title} (v2.0)")
 st.markdown(f"### 🕒 Local Time: {current_time} ({station_tz})")
 
 # Split Data (Today vs Yesterday)
