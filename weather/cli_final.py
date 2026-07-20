@@ -3,12 +3,22 @@ import re
 import sqlite3
 import json
 import os
+import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# Windows consoles default to cp1252 and crash on the emoji in our logs; force UTF-8.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # --- CONFIGURATION ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(BASE_DIR, 'config', 'stations.json')
 DB_PATH = os.path.join(BASE_DIR, 'data', 'daily_results.db')
+
+SESSION = requests.Session()
 
 def load_config():
     with open(CONFIG_PATH, 'r') as f:
@@ -25,7 +35,7 @@ def fetch_cli_html(wfo, cli_code, user_agent):
     
     try:
         print(f"   -> Fetching: {url}")
-        response = requests.get(url, headers=headers, timeout=10)
+        response = SESSION.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         
         # EXTRACT THE TEXT INSIDE THE <pre> TAG
@@ -101,27 +111,35 @@ def save_result(station_id, date_str, high, low):
 def run_cli_check():
     config = load_config()
     user_agent = config['defaults']['user_agent']
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    
-    print(f"--- CHECKING OFFICIAL RESULTS (USER URL METHOD) ---")
-    
+
+    print("--- CHECKING OFFICIAL RESULTS (USER URL METHOD) ---")
+
     for key, station in config['stations'].items():
         wfo = station['wfo']
-        cli_code = station['cli_code'] # Using our new config field!
+        cli_code = station.get('cli_code')  # optional per station
         sid = station['station_id']
-        
+
+        # Skip stations that have no CLI product configured (instead of crashing)
+        if not cli_code:
+            print(f"⏭️  Skipping {sid}: no 'cli_code' in config.")
+            continue
+
+        # Date the result by the STATION's local day, not the server's
+        tz = station.get('timezone', 'America/New_York')
+        today_str = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
+
         # 1. Fetch
         raw_text = fetch_cli_html(wfo, cli_code, user_agent)
-        
+
         # 2. Parse
         if raw_text:
             high, low = parse_cli_text(raw_text)
-            
+
             if high is not None and low is not None:
                 save_result(sid, today_str, high, low)
             else:
                 print(f"⚠️  Found report for {cli_code} but could not parse temps.")
-        
+
     print("---------------------------------------------")
 
 if __name__ == "__main__":

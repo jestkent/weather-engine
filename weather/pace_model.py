@@ -1,7 +1,15 @@
 import sqlite3
 import json
 import os
+import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# Windows consoles default to cp1252 and crash on the emoji in our logs; force UTF-8.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # --- CONFIGURATION ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -12,24 +20,32 @@ def load_config():
     with open(CONFIG_PATH, 'r') as f:
         return json.load(f)
 
-def get_todays_observations(station_id):
+def local_day_start_utc(tz_name):
+    """UTC ISO string for the most recent LOCAL midnight in the given timezone.
+
+    Daily high/low is a local-day concept. UTC midnight is 7-8pm local for US
+    stations, so filtering on UTC midnight mixes two calendar days. NWS timestamps
+    are stored as UTC (`...+00:00`), so we return a matching UTC string to compare.
     """
-    Fetches all temperature readings for the station since Midnight UTC.
-    """
+    now_local = datetime.now(ZoneInfo(tz_name))
+    midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def get_todays_observations(station_id, tz_name):
+    """Fetches all temperature readings for the station since LOCAL midnight."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # Get start of today (UTC) - Simplified for this prototype
-    # In a real app, you'd handle local timezones more strictly.
-    today_start = datetime.utcnow().strftime("%Y-%m-%dT00:00:00")
-    
+
+    today_start = local_day_start_utc(tz_name)
+
     cursor.execute('''
-        SELECT timestamp, temp_f 
-        FROM observations 
-        WHERE station_id = ? AND timestamp >= ?
+        SELECT timestamp, temp_f
+        FROM observations
+        WHERE station_id = ? AND timestamp >= ? AND temp_f IS NOT NULL
         ORDER BY timestamp ASC
     ''', (station_id, today_start))
-    
+
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -69,10 +85,10 @@ def calculate_velocity(observations):
     
     return 0.0
 
-def analyze_station(station_id, name):
+def analyze_station(station_id, name, tz_name):
     print(f"\n📊 ANALYZING: {name} ({station_id})")
-    
-    data = get_todays_observations(station_id)
+
+    data = get_todays_observations(station_id, tz_name)
     
     if not data:
         print("   ⚠️  No data found for today yet.")
@@ -119,7 +135,8 @@ def run_analysis():
     print("--- 🧠 LIVE PACE MODEL ENGINE ---")
     
     for key, station in config['stations'].items():
-        analyze_station(station['station_id'], station['name'])
+        tz_name = station.get('timezone', 'America/New_York')
+        analyze_station(station['station_id'], station['name'], tz_name)
         
     print("\n---------------------------------")
 

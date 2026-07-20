@@ -38,30 +38,35 @@
         "MIAMI_FL": {
             "station_id": "KMIA",
             "wfo": "MFL",
+            "cli_code": "MIA",
             "timezone": "America/New_York",
             "name": "Miami International Airport"
         },
         "SAN_FRANCISCO_CA": {
             "station_id": "KSFO",
             "wfo": "MTR",
+            "cli_code": "SFO",
             "timezone": "America/Los_Angeles",
             "name": "San Francisco International Airport"
         },
         "LAS_VEGAS_NV": {
             "station_id": "KLAS",
             "wfo": "VEF",
+            "cli_code": "LAS",
             "timezone": "America/Los_Angeles",
             "name": "Las Vegas Harry Reid Airport"
         },
         "DENVER_CO": {
             "station_id": "KDEN",
             "wfo": "BOU",
+            "cli_code": "DEN",
             "timezone": "America/Denver",
             "name": "Denver International Airport"
         },
         "SEATTLE_WA": {
             "station_id": "KSEA",
             "wfo": "SEW",
+            "cli_code": "SEA",
             "timezone": "America/Los_Angeles",
             "name": "Seattle-Tacoma International Airport"
         }

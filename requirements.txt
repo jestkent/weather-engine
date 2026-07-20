@@ -1,0 +1,8 @@
+# Weather Engine — pinned dependencies
+# Regenerate with: py -m pip freeze
+streamlit==1.45.1
+pandas==2.3.0
+plotly==6.5.2
+pytz==2025.1
+requests==2.32.4
+numpy==2.2.3
