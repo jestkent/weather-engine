@@ -40,6 +40,32 @@ Docker: `docker build -t weather-engine . && docker run -d --restart=unless-stop
 (Windows Scheduled Task or always-on Docker host) — the collector code is robust, but a
 sleeping laptop still pauses collection.
 
+## Production deployment (the real 24/7 host)
+
+**This repo is the source/dev copy. The live collector runs on a Raspberry Pi**, NOT on any
+laptop. A local `data/observations.db` here is only as fresh as the last time someone ran the
+collector on that machine — it says nothing about production. To judge whether collection is
+actually live, check the **Pi**, not this checkout.
+
+- **Host:** `kent-pi5@192.168.2.140` (hostname `kentpi5-desktop`), same box as the IBKR bot.
+- **Runs as Docker container `weather-station`** (`restart: always`), started from this repo's
+  `Dockerfile` — `run_forever.py` + Streamlit together. `docker` + `containerd` are enabled at
+  boot, so it self-heals on crash **and** survives reboots. No systemd unit needed (Docker is the
+  supervisor — do NOT add one, it would conflict).
+- **Databases live on a bind mount:** `/home/kent-pi5/weather-engine/data -> /app/data`, so both
+  `.db` files persist across container rebuilds.
+- **Dashboard:** `http://192.168.2.140:8501`.
+
+Check it's live (read-only, from anywhere that can SSH the Pi):
+
+```bash
+ssh kent-pi5@192.168.2.140 "docker ps --filter name=weather-station; \
+  docker exec weather-station python3 -c \"import sqlite3; \
+  print(sqlite3.connect('/app/data/observations.db').execute('SELECT MAX(timestamp) FROM observations').fetchone())\""
+```
+
+Latest timestamp within ~1h during US daytime = healthy.
+
 ## Databases
 
 **`data/observations.db` — table `observations`** (created by the collector; this is the
