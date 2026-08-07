@@ -1,146 +1,166 @@
-import requests
+"""Scrape the NWS CLI (Climate) report -> data/daily_results.db.
+
+This is the RESOLUTION source: Polymarket weather markets settle on the official CLI
+daily high/low, so getting the date and the finality right matters more than anything.
+
+Two correctness rules learned from the real reports:
+
+1. DATE the row by the report's own "...CLIMATE SUMMARY FOR <MONTH DAY YEAR>..." line,
+   never by wall-clock "today". A report issued 2:34 AM Jul 27 summarizes JULY 26; the
+   old code stamped it Jul 27 (off-by-one), corrupting the resolution row.
+
+2. FINAL vs PRELIMINARY. A report whose temperature block is headed "YESTERDAY" is the
+   settled morning summary (is_final=1). One headed "TODAY" (with "VALID TODAY AS OF
+   HHMM ...") is an intraday running value that will still change (is_final=0). We never
+   let a preliminary overwrite a stored final.
+"""
+import html
 import re
-import sqlite3
-import json
-import os
-import sys
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
-# Windows consoles default to cp1252 and crash on the emoji in our logs; force UTF-8.
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+import requests
 
-# --- CONFIGURATION ---
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_PATH = os.path.join(BASE_DIR, 'config', 'stations.json')
-DB_PATH = os.path.join(BASE_DIR, 'data', 'daily_results.db')
+from common import (
+    RESULTS_DB_PATH, get_logger, get_user_agent, get_with_retry, init_results_db,
+    load_config, open_db,
+)
 
-SESSION = requests.Session()
+log = get_logger("cli_final")
 
-def load_config():
-    with open(CONFIG_PATH, 'r') as f:
-        return json.load(f)
+VALID_MIN, VALID_MAX = -60.0, 140.0  # sanity bounds for a US surface temperature (F)
 
-def fetch_cli_html(wfo, cli_code, user_agent):
-    """
-    Fetches the HTML page using the specific CLI code (e.g., LAX, NYC).
-    URL: https://forecast.weather.gov/product.php?site=LOX&product=CLI&issuedby=LAX
-    """
+
+def fetch_cli_text(session, wfo, cli_code, user_agent):
+    """Return the plain text inside the report's <pre> block, or None."""
     url = f"https://forecast.weather.gov/product.php?site={wfo}&product=CLI&issuedby={cli_code}"
-    
-    headers = {"User-Agent": user_agent}
-    
-    try:
-        print(f"   -> Fetching: {url}")
-        response = SESSION.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        
-        # EXTRACT THE TEXT INSIDE THE <pre> TAG
-        # The report is always wrapped in <pre> tags on this page.
-        html_content = response.text
-        match = re.search(r'<pre[^>]*>(.*?)</pre>', html_content, re.DOTALL)
-        
-        if match:
-            return match.group(1) # Return just the text inside
-        else:
-            print("   -> ⚠️ Loaded page, but could not find <pre> tag.")
-            return None
+    resp = get_with_retry(session, url, headers={"User-Agent": user_agent}, timeout=15, logger=log)
+    if resp is None or resp.status_code != 200:
+        log.warning("%s: fetch failed (%s)", cli_code, getattr(resp, "status_code", "no response"))
+        return None
+    match = re.search(r"<pre[^>]*>(.*?)</pre>", resp.text, re.DOTALL)
+    if not match:
+        # e.g. KSOW: this WFO/code has no CLI product page.
+        log.warning("%s: page loaded but has no <pre> report block", cli_code)
+        return None
+    return html.unescape(match.group(1))
 
-    except Exception as e:
-        print(f"❌ Error fetching {cli_code}: {e}")
+
+def parse_report_date(text):
+    """Date the report is FOR, from '...CLIMATE SUMMARY FOR JULY 26 2026...'. -> 'YYYY-MM-DD' or None."""
+    m = re.search(r"SUMMARY FOR\s+([A-Z]+\s+\d{1,2}\s+\d{4})", text, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1).title(), "%B %d %Y").strftime("%Y-%m-%d")
+    except ValueError:
         return None
 
-def parse_cli_text(text):
+
+def parse_temps_and_finality(text):
+    """Return (high_f, low_f, is_final).
+
+    Reads the MAXIMUM/MINIMUM 'observed' value (first number on the line) from within
+    the TEMPERATURE section only, and decides finality from the TODAY/YESTERDAY heading
+    plus the 'VALID TODAY AS OF' marker.
     """
-    Scans the text report for Max/Min temperatures.
-    """
-    if not text:
-        return None, None
+    lines = text.split("\n")
 
-    lines = text.split('\n')
-    max_temp = None
-    min_temp = None
-    
-    for line in lines:
-        clean_line = line.upper().strip()
-        
-        if "FORECAST" in clean_line: continue
-
-        # LOOK FOR HIGH
-        # Matches "MAXIMUM... 82", "MAX TEMP... 82"
-        if "MAX" in clean_line and ("TEMP" in clean_line or "YESTERDAY" in clean_line):
-            numbers = re.findall(r"[-+]?\d*\.\d+|\d+", clean_line)
-            if numbers and max_temp is None:
-                try:
-                    val = float(numbers[0])
-                    if -40 < val < 135: max_temp = val
-                except: pass
-
-        # LOOK FOR LOW
-        if "MIN" in clean_line and ("TEMP" in clean_line or "YESTERDAY" in clean_line):
-            numbers = re.findall(r"[-+]?\d*\.\d+|\d+", clean_line)
-            if numbers and min_temp is None:
-                try:
-                    val = float(numbers[0])
-                    if -40 < val < 135: min_temp = val
-                except: pass
-                    
-        if max_temp is not None and min_temp is not None:
+    # Isolate the TEMPERATURE (F) block: from its header to the next section.
+    start = next((i for i, ln in enumerate(lines) if ln.strip().upper().startswith("TEMPERATURE")), None)
+    if start is None:
+        return None, None, 0
+    block = []
+    for ln in lines[start + 1:]:
+        s = ln.strip().upper()
+        if s.startswith(("PRECIPITATION", "SNOWFALL", "DEGREE DAYS", "WIND")):
             break
-            
-    return max_temp, min_temp
+        block.append(ln)
 
-def save_result(station_id, date_str, high, low):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''
-            INSERT OR REPLACE INTO daily_results (station_id, date, high_f, low_f, is_final)
-            VALUES (?, ?, ?, ?, 1)
-        ''', (station_id, date_str, high, low))
-        print(f"✅ LOCKED: {station_id} | High: {high}°F | Low: {low}°F | Date: {date_str}")
-        conn.commit()
-    except Exception as e:
-        print(f"❌ Database Error: {e}")
-    finally:
-        conn.close()
+    # Intraday reports say the day isn't settled yet.
+    intraday = "VALID TODAY AS OF" in text.upper()
+    period_is_today = None  # True=TODAY, False=YESTERDAY, None=unknown
+
+    high = low = None
+    for ln in block:
+        s = ln.strip().upper()
+        if s == "TODAY":
+            period_is_today = True
+        elif s == "YESTERDAY":
+            period_is_today = False
+        elif s.startswith("MAXIMUM") and high is None:
+            high = _first_temp(s)
+        elif s.startswith("MINIMUM") and low is None:
+            low = _first_temp(s)
+
+    # Final = settled prior-day summary: labeled YESTERDAY and not an intraday snapshot.
+    is_final = 1 if (period_is_today is False and not intraday) else 0
+    return high, low, is_final
+
+
+def _first_temp(line):
+    """First integer/decimal on the line (the observed value column), if in range."""
+    for tok in re.findall(r"-?\d+(?:\.\d+)?", line):
+        val = float(tok)
+        if VALID_MIN <= val <= VALID_MAX:
+            return val
+    return None
+
+
+def save_result(conn, station_id, date_str, high, low, is_final):
+    """Upsert on (station_id, date); never let a preliminary clobber a stored final."""
+    c = conn.cursor()
+    c.execute("SELECT is_final FROM daily_results WHERE station_id=? AND date=?",
+              (station_id, date_str))
+    row = c.fetchone()
+    if row and row[0] == 1 and is_final == 0:
+        log.info("%s %s: keeping stored FINAL, ignoring preliminary %s/%s",
+                 station_id, date_str, high, low)
+        return
+    c.execute("""
+        INSERT INTO daily_results (station_id, date, high_f, low_f, is_final)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(station_id, date) DO UPDATE SET
+            high_f=excluded.high_f, low_f=excluded.low_f, is_final=excluded.is_final
+    """, (station_id, date_str, high, low, is_final))
+    conn.commit()
+    tag = "FINAL" if is_final else "prelim"
+    log.info("%s %s: high=%s low=%s [%s]", station_id, date_str, high, low, tag)
+
 
 def run_cli_check():
     config = load_config()
-    user_agent = config['defaults']['user_agent']
+    user_agent = get_user_agent(config)
+    session = requests.Session()
+    conn = open_db(RESULTS_DB_PATH)
+    init_results_db(conn)
 
-    print("--- CHECKING OFFICIAL RESULTS (USER URL METHOD) ---")
-
-    for key, station in config['stations'].items():
-        wfo = station['wfo']
-        cli_code = station.get('cli_code')  # optional per station
-        sid = station['station_id']
-
-        # Skip stations that have no CLI product configured (instead of crashing)
+    log.info("--- CLI results check start ---")
+    for _, station in config["stations"].items():
+        sid = station["station_id"]
+        wfo = station["wfo"]
+        cli_code = station.get("cli_code")
         if not cli_code:
-            print(f"⏭️  Skipping {sid}: no 'cli_code' in config.")
+            log.info("%s: skipped (no cli_code in config)", sid)
             continue
 
-        # Date the result by the STATION's local day, not the server's
-        tz = station.get('timezone', 'America/New_York')
-        today_str = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
+        text = fetch_cli_text(session, wfo, cli_code, user_agent)
+        if not text:
+            continue
 
-        # 1. Fetch
-        raw_text = fetch_cli_html(wfo, cli_code, user_agent)
+        date_str = parse_report_date(text)
+        if not date_str:
+            log.warning("%s: could not parse report date; skipping", sid)
+            continue
 
-        # 2. Parse
-        if raw_text:
-            high, low = parse_cli_text(raw_text)
+        high, low, is_final = parse_temps_and_finality(text)
+        if high is None and low is None:
+            log.warning("%s %s: found report but parsed no temps", sid, date_str)
+            continue
+        save_result(conn, sid, date_str, high, low, is_final)
 
-            if high is not None and low is not None:
-                save_result(sid, today_str, high, low)
-            else:
-                print(f"⚠️  Found report for {cli_code} but could not parse temps.")
+    conn.close()
+    log.info("--- CLI results check done ---")
 
-    print("---------------------------------------------")
 
 if __name__ == "__main__":
     run_cli_check()

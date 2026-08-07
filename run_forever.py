@@ -1,95 +1,71 @@
-import time
+"""24/7 scheduler: runs the observation collector every 15 min and the official CLI
+scrape ~hourly. This is the process to keep alive (see deploy/ for auto-start setup).
+
+Hardened so a single bad cycle can't silently kill collection:
+  - each child runs under a hard timeout (a hung request can't freeze the loop forever)
+  - the whole cycle body is wrapped so an unexpected error is logged and we continue
+  - sleep is drift-corrected so cycles stay aligned to the 15-min cadence
+  - everything goes to logs/scheduler.log, so a crash leaves a trail
+"""
+import os
 import subprocess
 import sys
-import sqlite3
-import os
-from datetime import datetime
+import time
 
-# Windows consoles default to cp1252 and crash on the emoji in our logs; force UTF-8.
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+from weather.common import get_logger
 
-# --- CONFIGURATION ---
-DB_FILE = "data/observations.db"
-COLLECTOR_SCRIPT = "weather/live_observations.py"
-CLI_SCRIPT = "weather/cli_final.py"
-INTERVAL_SECONDS = 900          # 15 minutes between observation polls
-CLI_EVERY_N_CYCLES = 4          # run the official CLI scrape ~hourly (4 * 15 min)
+log = get_logger("scheduler")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+COLLECTOR = os.path.join(BASE_DIR, "weather", "live_observations.py")
+CLI_SCRIPT = os.path.join(BASE_DIR, "weather", "cli_final.py")
 
-# --- 1. SELF-HEALING DATABASE FUNCTION ---
-def init_db():
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛠️ Checking database health...")
-
-    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS observations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            station_id TEXT,
-            timestamp TEXT,
-            temp_f REAL,
-            humidity REAL,
-            wind_speed REAL,
-            description TEXT,
-            raw_json TEXT
-        )
-    ''')
-    # Dedup legacy rows, then enforce (station_id, timestamp) uniqueness (see CLAUDE.md)
-    c.execute('''
-        DELETE FROM observations
-        WHERE id NOT IN (
-            SELECT MIN(id) FROM observations GROUP BY station_id, timestamp
-        )
-    ''')
-    c.execute('''
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_unique
-        ON observations (station_id, timestamp)
-    ''')
-    conn.commit()
-    conn.close()
-    print("✅ Database table is ready.")
+INTERVAL_SECONDS = 900       # 15 minutes between observation polls
+CLI_EVERY_N_CYCLES = 4       # official CLI scrape ~hourly (4 * 15 min)
+CHILD_TIMEOUT = 300          # kill a child that runs longer than 5 min (likely hung)
 
 
 def run_script(script):
-    """Runs a collector script as a subprocess, reporting crashes without dying."""
+    """Run a collector as a subprocess under a timeout. Never raises."""
+    name = os.path.basename(script)
     try:
-        result = subprocess.run([sys.executable, script])
+        result = subprocess.run([sys.executable, script], timeout=CHILD_TIMEOUT,
+                                capture_output=True, text=True)
         if result.returncode == 0:
-            print(f"✅ {script} finished.")
+            log.info("%s finished OK", name)
         else:
-            print(f"❌ {script} exited with code {result.returncode}!")
+            log.error("%s exited %s; stderr tail: %s",
+                      name, result.returncode, (result.stderr or "").strip()[-500:])
+    except subprocess.TimeoutExpired:
+        log.error("%s TIMED OUT after %ss and was killed", name, CHILD_TIMEOUT)
     except Exception as e:
-        print(f"❌ Failed to launch {script}: {e}")
+        log.error("failed to launch %s: %s", name, e)
 
 
-# --- 2. MAIN LOOP ---
-print("--- 🔄 STARTING 24/7 WEATHER COLLECTOR ---")
-
-# Run the setup ONCE before the loop starts
-init_db()
-
-cycle = 0
-try:
+def main():
+    log.info("=== STARTING 24/7 WEATHER COLLECTOR (interval=%ss) ===", INTERVAL_SECONDS)
+    cycle = 0
     while True:
-        now = datetime.now().strftime("%I:%M %p")
-        print(f"\n[{now}] Waking up to collect data...")
-
-        # Live observations every cycle
-        run_script(COLLECTOR_SCRIPT)
-
-        # Official daily high/low (the market resolution source) ~hourly
-        if cycle % CLI_EVERY_N_CYCLES == 0:
-            print(f"[{now}] 📰 Fetching official CLI daily results...")
-            run_script(CLI_SCRIPT)
+        started = time.monotonic()
+        try:
+            log.info("cycle %d: collecting observations", cycle)
+            run_script(COLLECTOR)
+            if cycle % CLI_EVERY_N_CYCLES == 0:
+                log.info("cycle %d: fetching official CLI results", cycle)
+                run_script(CLI_SCRIPT)
+        except Exception as e:  # belt-and-suspenders: a bad cycle must not kill the loop
+            log.exception("unexpected error in cycle %d: %s", cycle, e)
 
         cycle += 1
-        print(f"💤 Sleeping for {INTERVAL_SECONDS / 60:.0f} minutes...")
-        time.sleep(INTERVAL_SECONDS)
+        # Drift-corrected sleep: subtract the work we already did this cycle.
+        elapsed = time.monotonic() - started
+        nap = max(1.0, INTERVAL_SECONDS - elapsed)
+        log.info("sleeping %.0f min", nap / 60)
+        time.sleep(nap)
 
-except KeyboardInterrupt:
-    print("\n🛑 Stopping collector. Goodbye!")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("stopping collector (keyboard interrupt)")

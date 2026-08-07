@@ -24,7 +24,8 @@
         "SHOW_LOW_AZ": {
             "station_id": "KSOW",
             "wfo": "FGZ",
-            "cli_code": "SOW",
+            "cli_code": null,
+            "cli_note": "FGZ issues no CLI product for SOW (page returns no <pre>). Observations still collected; NO official resolution source. Verify or replace before trading this station.",
             "timezone": "America/Phoenix",
             "name": "Show Low Regional Airport (Cibecue Area)"
         },

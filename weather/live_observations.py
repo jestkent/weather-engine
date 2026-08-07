@@ -1,145 +1,110 @@
-import requests
-import sqlite3
+"""Collect NWS temperature observations into data/observations.db.
+
+Why full history, not just "latest": the market edge is the running daily HIGH.
+The old collector polled /observations/latest (a single instant) and took max() over
+whatever it happened to catch, so ANY downtime, or NWS simply skipping the peak minute,
+made the running high read low. Instead we pull every observation since the station's
+LOCAL midnight (/observations?start=...) each cycle. INSERT OR IGNORE dedups, so this is
+idempotent AND self-healing: a cycle that runs after an outage backfills the gap and
+recovers the true peak.
+"""
 import json
-from datetime import datetime
-import os
-import sys
 import time
 
-# Windows consoles default to cp1252 and crash on the emoji in our logs; force UTF-8.
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+import requests
 
-# --- CONFIGURATION ---
-DB_FILE = "data/observations.db"
-CONFIG_FILE = "config/stations.json"
+from common import (
+    OBS_DB_PATH, get_logger, get_user_agent, get_with_retry, init_observations_db,
+    load_config, local_day_start_utc, open_db,
+)
 
-# 🚨 THE FIX: A polite ID card for the API (NWS returns 403 without a User-Agent)
-HEADERS = {
-    "User-Agent": "(student-weather-station-v1.0, contact@github.com)"
-}
+log = get_logger("observations")
 
-# Reuse one TCP connection across all station requests (faster, kinder to the API)
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
 
-def get_stations():
-    """Reads the JSON config file."""
+def build_session(user_agent):
+    s = requests.Session()
+    s.headers.update({"User-Agent": user_agent})
+    return s
+
+
+def fetch_todays_observations(session, station_id, tz_name):
+    """All observations for the station since its LOCAL midnight (list of feature props)."""
+    start = local_day_start_utc(tz_name)
+    url = f"https://api.weather.gov/stations/{station_id}/observations"
+    resp = get_with_retry(session, url, params={"start": start}, timeout=15, logger=log)
+    if resp is None:
+        return []
+    if resp.status_code != 200:
+        log.warning("API error for %s: %s", station_id, resp.status_code)
+        return []
     try:
-        with open(CONFIG_FILE, "r") as f:
-            data = json.load(f)
-            return data["stations"]
-    except FileNotFoundError:
-        print(f"❌ Error: Config file {CONFIG_FILE} not found!")
-        return {}
+        features = resp.json().get("features", [])
+    except ValueError:
+        log.warning("Non-JSON response for %s", station_id)
+        return []
+    return [f.get("properties", {}) for f in features]
 
-def init_db():
-    """Ensures the DB exists and enforces (station_id, timestamp) uniqueness.
 
-    NWS 'latest observation' only updates ~hourly, but we poll every 15 min, so the
-    same reading would otherwise be inserted 3-4x. We dedup legacy rows once, then a
-    UNIQUE index + INSERT OR IGNORE keeps it clean going forward.
-    """
-    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS observations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            station_id TEXT,
-            timestamp TEXT,
-            temp_f REAL,
-            humidity REAL,
-            wind_speed REAL,
-            description TEXT,
-            raw_json TEXT
-        )
-    ''')
-    # Migrate: drop any pre-existing duplicate readings (keep the earliest id)
-    c.execute('''
-        DELETE FROM observations
-        WHERE id NOT IN (
-            SELECT MIN(id) FROM observations GROUP BY station_id, timestamp
-        )
-    ''')
-    # Enforce uniqueness from now on
-    c.execute('''
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_unique
-        ON observations (station_id, timestamp)
-    ''')
-    conn.commit()
-    conn.close()
-
-def fetch_weather(station_id):
-    """Gets data from NWS API with the new Headers."""
-    url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
-    
-    try:
-        # Uses the shared session (User-Agent already set) so NWS doesn't 403 us
-        response = SESSION.get(url, timeout=10)
-
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"⚠️ API Error for {station_id}: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"❌ Connection Error for {station_id}: {e}")
+def to_row(station_id, props):
+    """Map one NWS observation to our column tuple, or None if it has no timestamp."""
+    timestamp = props.get("timestamp")
+    if not timestamp:
         return None
 
-def save_observation(station_id, data):
-    """Saves the data to SQLite."""
-    if not data: return
+    # NWS temperature is Celsius. Guard with `is not None`, NOT truthiness: a real
+    # 0.0 C reading (= 32 F, common winter at KNYC/KORD/KDEN) is falsy.
+    temp_c = props.get("temperature", {}).get("value")
+    temp_f = (temp_c * 9 / 5) + 32 if temp_c is not None else None
 
-    try:
-        props = data.get('properties', {})
-        
-        # Extract fields. NWS gives temperature in Celsius.
-        # NOTE: must be `is not None`, NOT `if temp_f:` — a real 0.0 C reading (= 32 F,
-        # common in winter at KNYC/KORD/KDEN) is falsy and would be stored as 0 F.
-        temp_f = props.get('temperature', {}).get('value')
-        if temp_f is not None:
-            temp_f = (temp_f * 9 / 5) + 32  # Convert C to F
-        
-        humidity = props.get('relativeHumidity', {}).get('value')
-        wind = props.get('windSpeed', {}).get('value')
-        desc = props.get('textDescription', 'Unknown')
-        timestamp = props.get('timestamp', datetime.now().isoformat())
-        raw_json = json.dumps(data)
+    humidity = props.get("relativeHumidity", {}).get("value")
+    wind = props.get("windSpeed", {}).get("value")
+    desc = props.get("textDescription", "Unknown")
+    return (station_id, timestamp, temp_f, humidity, wind, desc, json.dumps(props))
 
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('''
-            INSERT OR IGNORE INTO observations
-            (station_id, timestamp, temp_f, humidity, wind_speed, description, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (station_id, timestamp, temp_f, humidity, wind, desc, raw_json))
-        
-        conn.commit()
-        inserted = c.rowcount  # 0 if this (station, timestamp) was already stored
-        conn.close()
-        temp_display = f"{temp_f:.1f}°F" if temp_f is not None else "N/A"
-        if inserted:
-            print(f"✅ SAVED: {station_id} | {temp_display}")
-        else:
-            print(f"➡️  UNCHANGED: {station_id} | {temp_display} (obs not updated yet)")
-        
-    except Exception as e:
-        print(f"❌ Error saving {station_id}: {e}")
 
-# --- MAIN LOOP ---
-if __name__ == "__main__":
-    print(f"--- STARTING COLLECTION: {datetime.now().strftime('%H:%M:%S')} ---")
-    init_db()
-    stations = get_stations()
-    
-    for name, info in stations.items():
+def save_observations(conn, rows):
+    """Bulk INSERT OR IGNORE; returns count of NEW rows actually stored."""
+    rows = [r for r in rows if r is not None]
+    if not rows:
+        return 0
+    c = conn.cursor()
+    before = conn.total_changes
+    c.executemany("""
+        INSERT OR IGNORE INTO observations
+        (station_id, timestamp, temp_f, humidity, wind_speed, description, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, rows)
+    conn.commit()
+    return conn.total_changes - before
+
+
+def collect():
+    config = load_config()
+    session = build_session(get_user_agent(config))
+    conn = open_db(OBS_DB_PATH)
+    init_observations_db(conn)
+
+    log.info("--- collection start ---")
+    total_new = 0
+    for name, info in config["stations"].items():
         sid = info["station_id"]
-        print(f"Fetching {name} ({sid})...")
-        weather_data = fetch_weather(sid)
-        save_observation(sid, weather_data)
-        time.sleep(1) # Be polite, wait 1 second between requests
-        
-    print("---------------------------------------------")
+        tz_name = info.get("timezone", "America/New_York")
+        props_list = fetch_todays_observations(session, sid, tz_name)
+        rows = [to_row(sid, p) for p in props_list]
+        new = save_observations(conn, rows)
+        total_new += new
+
+        # Report the running high so a glance at the log tells you the day's peak.
+        temps = [r[2] for r in rows if r and r[2] is not None]
+        hi = f"{max(temps):.1f}F" if temps else "n/a"
+        log.info("%-6s %-22s seen=%2d new=%2d running_high=%s",
+                 sid, name, len(props_list), new, hi)
+        time.sleep(1)  # be polite between stations
+
+    conn.close()
+    log.info("--- collection done: %d new rows ---", total_new)
+    return total_new
+
+
+if __name__ == "__main__":
+    collect()

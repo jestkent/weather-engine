@@ -9,15 +9,18 @@ short of) a market threshold before the official number is posted in the afterno
 ## Architecture / data flow
 
 ```
-config/stations.json        <- single source of truth: 10 stations (id, wfo, cli_code, tz)
+config/stations.json        <- single source of truth: 10 stations (station_id, wfo, cli_code, timezone)
         |
         v
-weather/live_observations.py  --NWS latest obs (~hourly)-->  data/observations.db (table: observations)
-weather/cli_final.py          --NWS CLI report scrape-->     data/daily_results.db (table: daily_results)
-weather/pace_model.py         reads observations.db -> velocity / running high-low (CLI report)
+weather/common.py             shared: config load, WAL db conn, HTTP retry/backoff, file logging
+weather/live_observations.py  --NWS full day history-->    data/observations.db (table: observations)
+weather/cli_final.py          --NWS CLI report scrape-->   data/daily_results.db (table: daily_results)
+weather/pace_model.py         reads observations.db -> velocity (regression) / running high-low
 weather/signal.py             reads observations + NWS forecast -> per-station trade signal
 run_forever.py                scheduler: runs live_observations every 15 min, cli_final hourly
 app.py                        Streamlit dashboard (chart + forecast)
+logs/                         rotating logs: scheduler.log, observations.log, cli_final.log
+deploy/                       24/7 keep-alive: Windows Scheduled Task scripts + README
 ```
 
 ## Commands (Windows: use `py`, not `python`)
@@ -32,8 +35,10 @@ py weather/signal.py              # trade signal: running high vs forecast high 
 py -m streamlit run app.py        # dashboard on :8501
 ```
 
-Docker: `docker build -t weather-engine . && docker run -p 8501:8501 weather-engine`
-(runs `run_forever.py` + streamlit together).
+Docker: `docker build -t weather-engine . && docker run -d --restart=unless-stopped -p 8501:8501 -v weather_data:/app/data weather-engine`
+(runs `run_forever.py` + streamlit together). See **`deploy/README.md`** for 24/7 setup
+(Windows Scheduled Task or always-on Docker host) — the collector code is robust, but a
+sleeping laptop still pauses collection.
 
 ## Databases
 
@@ -44,11 +49,14 @@ with a `UNIQUE(station_id, timestamp)` index. Inserts use `INSERT OR IGNORE` so 
 same (unchanged) NWS observation does not create duplicates.
 
 **`data/daily_results.db` — table `daily_results`**:
-`id, station_id, date, high_f, low_f, is_final`. `is_final=1` = scraped from the CLI report
-(the resolution source). `INSERT OR REPLACE` on `(station_id, date)`.
+`id, station_id, date, high_f, low_f, is_final` with `UNIQUE(station_id, date)`.
+`is_final=1` = a **settled** CLI summary (report's temp block is headed `YESTERDAY`);
+`is_final=0` = an **intraday/preliminary** report (headed `TODAY`, still `VALID TODAY AS OF …`).
+Upsert on `(station_id, date)` **never lets a preliminary overwrite a stored final**.
+Rows are dated by the report's own `CLIMATE SUMMARY FOR <date>` line, not wall-clock today.
 
-> Note: `initialize_db.py` contains an OLDER/alternate schema and is NOT the source of truth —
-> the collector scripts create the live tables. Prefer `run_forever.py` / `live_observations.py`.
+> DB writes use WAL mode so the Streamlit dashboard can read while the collector writes.
+> Schema is created centrally in `weather/common.py` (`init_observations_db` / `init_results_db`).
 
 ## Gotchas / domain rules
 
@@ -56,10 +64,19 @@ same (unchanged) NWS observation does not create duplicates.
   `if temp_f is not None` — never `if temp_f:` (0.0 °C = 32 °F is a real winter reading and is falsy).
 - **Daily high/low is a LOCAL-day concept.** UTC midnight is 7–8pm local for US stations, so any
   "today's high" query must use the station's local timezone, not UTC.
-- **NWS "latest observation" only updates ~hourly**, but we poll every 15 min. Dedup is essential.
-- **NWS API needs a `User-Agent` header** or it returns 403. Keep one set.
+- **Collect the FULL day's observations, not just `/observations/latest`.** We pull
+  `/observations?start=<local-midnight-UTC>` each cycle so the running high is robust to
+  downtime/polling gaps (a cycle after an outage backfills the peak). `INSERT OR IGNORE`
+  dedups, making it idempotent. Pass the ISO `start` via `params=` so `+00:00` is
+  URL-encoded — baking it into the URL 400s (`+` decodes to a space).
+- **NWS API needs a `User-Agent` header** or it returns 403. Read from config `defaults.user_agent`.
 - Station gridpoint (station -> lat/lon -> forecast URL) is **static per station**; cache/precompute it.
 - Every station in `config/stations.json` needs a `cli_code` or `cli_final.py` skips it.
+  **KSOW (Show Low) has `cli_code: null`** — FGZ issues no CLI product for it, so it has
+  observations but NO official resolution source (see `cli_note` in config).
+- **CLI temp parsing anchors to the `TEMPERATURE (F)` section** and takes the *observed*
+  value column — not the first number on the line (which caught the `NORMAL` column, e.g.
+  storing PHX 106 instead of the real 110).
 
 ## Stations
 
