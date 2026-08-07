@@ -12,6 +12,10 @@ DB_FILE = "data/observations.db"
 CONFIG_FILE = "config/stations.json"
 USER_AGENT = "(weather-engine-v5, contact@github.com)"
 
+# One reused HTTP connection with the required NWS User-Agent
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": USER_AGENT})
+
 # --- TIMEZONE MAP ---
 STATION_TIMEZONES = {
     'KNYC': 'America/New_York',
@@ -46,6 +50,7 @@ def get_station_mapping():
         return {}
 
 # --- 2. GET STATIONS ---
+@st.cache_data(ttl=3600)
 def get_stations():
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -53,10 +58,11 @@ def get_stations():
         df = pd.read_sql(query, conn)
         conn.close()
         return df['station_id'].tolist()
-    except:
+    except Exception:
         return []
 
 # --- 3. GET DATA (FIXED TIMEZONES) ---
+@st.cache_data(ttl=300)
 def get_data(station_code):
     conn = sqlite3.connect(DB_FILE)
     query = """
@@ -84,29 +90,36 @@ def get_data(station_code):
     
     return df
 
-# --- 4. GET FORECAST ---
+# --- 4a. RESOLVE FORECAST URL (static per station -> cache for a day) ---
+@st.cache_data(ttl=86400)
+def resolve_forecast_url(station_id):
+    """station -> lat/lon -> gridpoint -> hourly forecast URL. This never changes,
+    so we cache it and skip 2 of the 3 API calls on every rerun."""
+    # Step 1: Get Lat/Lon
+    r1 = SESSION.get(f"https://api.weather.gov/stations/{station_id}")
+    if r1.status_code != 200:
+        return None
+    coords = r1.json()['geometry']['coordinates']
+    lon, lat = coords[0], coords[1]
+
+    # Step 2: Get Gridpoint
+    r2 = SESSION.get(f"https://api.weather.gov/points/{lat},{lon}")
+    if r2.status_code != 200:
+        return None
+    return r2.json()['properties']['forecastHourly']
+
+# --- 4b. GET FORECAST ---
+@st.cache_data(ttl=900)
 def get_forecast(station_id):
-    headers = {"User-Agent": USER_AGENT}
     try:
-        # Step 1: Get Lat/Lon
-        url1 = f"https://api.weather.gov/stations/{station_id}"
-        r1 = requests.get(url1, headers=headers)
-        if r1.status_code != 200: return pd.DataFrame()
-        
-        coords = r1.json()['geometry']['coordinates']
-        lon, lat = coords[0], coords[1]
-        
-        # Step 2: Get Gridpoint
-        url2 = f"https://api.weather.gov/points/{lat},{lon}"
-        r2 = requests.get(url2, headers=headers)
-        if r2.status_code != 200: return pd.DataFrame()
-        
-        forecast_url = r2.json()['properties']['forecastHourly']
-        
-        # Step 3: Get Data
-        r3 = requests.get(forecast_url, headers=headers)
+        forecast_url = resolve_forecast_url(station_id)
+        if not forecast_url:
+            return pd.DataFrame()
+
+        # Step 3: Get Data (the only call that actually changes hour to hour)
+        r3 = SESSION.get(forecast_url)
         if r3.status_code != 200: return pd.DataFrame()
-            
+
         periods = r3.json()['properties']['periods']
         future_data = []
         

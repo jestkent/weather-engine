@@ -1,22 +1,18 @@
-# 1. Base Image
 FROM python:3.11-slim
 
-# 2. Set Folder
 WORKDIR /app
 
-# --- THE SPEED FIX ---
-# We install the libraries BEFORE copying your code.
-# Docker will "Cache" this step. It won't run again unless you add a new library.
-RUN pip install --no-cache-dir streamlit pandas pytz requests plotly
-# ---------------------
+# Install deps first so Docker caches this layer until requirements.txt changes.
+# Use the pinned requirements file (not a hand-typed list) so the image matches dev.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. NOW copy your code
-# If you change app.py, Docker only starts working from HERE.
 COPY . /app
 
-# 4. Create data folder
-RUN mkdir -p /app/data
+# Runtime dirs (databases + rotating logs). data is a volume mount point in prod.
+RUN mkdir -p /app/data /app/logs
 
-# 5. Run it
 EXPOSE 8501
-CMD ["sh", "-c", "python3 run_forever.py & python3 -m streamlit run app.py --server.address=0.0.0.0"]
+
+# Run the 24/7 collector and the dashboard together.
+CMD ["sh", "-c", "python3 run_forever.py & python3 -m streamlit run app.py --server.address=0.0.0.0 --server.port=8501"]
